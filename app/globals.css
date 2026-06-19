@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0a0e14;
+  --panel: #131922;
+  --panel-2: #1b2330;
+  --border: #28323f;
+  --text: #e6edf3;
+  --muted: #8b98a9;
+  --accent: #c8aa6e; /* LoL gold */
+  --danger: #e5484d;
+  --good: #46c93a;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
