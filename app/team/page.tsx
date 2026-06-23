@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ChampPicker, { type ClientChampion } from "@/components/ChampPicker";
 import CompScorecard, { type Scorecard } from "@/components/CompScorecard";
 
@@ -126,6 +126,34 @@ const CRITERIA: { key: keyof Parts; label: string; color: string; desc: string }
   { key: "player", label: "Spieler-Pool", color: "#b07be0", desc: "Bonus, wenn der Champ ein Main des Spielers ist." },
 ];
 
+// Live-Champ-Select (Antwort von /api/champ-select, gespiegelt aus lib/lcu.ts)
+type LcuStatus = "client_not_running" | "not_in_champ_select" | "in_champ_select";
+interface ChampSelectCell {
+  championId: number;
+  position: Lane | null;
+  locked: boolean;
+  isLocalPlayer: boolean;
+}
+interface ChampSelectState {
+  status: LcuStatus;
+  allies: ChampSelectCell[];
+  enemies: ChampSelectCell[];
+  bans: number[];
+}
+
+const LIVE_STATUS_TEXT: Record<LcuStatus, string> = {
+  client_not_running:
+    "League-Client nicht gefunden — Client starten und einem Champ-Select beitreten.",
+  not_in_champ_select: "Client verbunden — warte auf Champ-Select…",
+  in_champ_select:
+    "Champ-Select erkannt — Picks & Vorschläge aktualisieren sich automatisch.",
+};
+const LIVE_STATUS_DOT: Record<LcuStatus, string> = {
+  client_not_running: "#e5484d",
+  not_in_champ_select: "#e0a64a",
+  in_champ_select: "#46c93a",
+};
+
 const REASON_COLOR: Record<Reason["kind"], string> = {
   counter: "#e5484d",
   comp: "#c8aa6e",
@@ -150,6 +178,10 @@ export default function TeamPage() {
   const [result, setResult] = useState<Result | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [live, setLive] = useState(false);
+  const [liveStatus, setLiveStatus] = useState<LcuStatus>("client_not_running");
+  const runIdRef = useRef(0); // verwirft veraltete Berechnungen
+  const runRef = useRef<() => void>(() => {}); // stets aktuelles run() für Auto-Trigger
 
   useEffect(() => {
     fetch("/api/champions")
@@ -164,6 +196,72 @@ export default function TeamPage() {
     return m;
   }, [champions]);
 
+  // Live-Champ-Select → Ally-Locks + Gegner übernehmen. Mains/Pool bleiben
+  // erhalten (der Spieler-Pool wird ja vorab konfiguriert).
+  const applyChampSelect = useCallback(
+    (state: ChampSelectState) => {
+      setAllies((prev) => {
+        const next = prev.map((a) => ({ ...a, locked: null as ClientChampion | null }));
+        const filled = new Set<number>(); // bereits belegte Lane-Indizes
+        const leftover: number[] = []; // Picks ohne bekannte Lane (Blind/Normal)
+        for (const c of state.allies) {
+          if (!c.championId) continue;
+          if (c.position) {
+            const i = next.findIndex((a) => a.lane === c.position);
+            if (i >= 0 && !filled.has(i)) {
+              next[i].locked = byCid.get(c.championId) ?? null;
+              filled.add(i);
+              continue;
+            }
+          }
+          leftover.push(c.championId);
+        }
+        // Lane-lose Picks der Reihe nach in noch offene Lanes setzen.
+        for (const cid of leftover) {
+          const i = next.findIndex((_, j) => !filled.has(j));
+          if (i < 0) break;
+          next[i].locked = byCid.get(cid) ?? null;
+          filled.add(i);
+        }
+        return next;
+      });
+
+      const en: EnemyState[] = [];
+      for (const c of state.enemies) {
+        if (!c.championId) continue;
+        const champ = byCid.get(c.championId);
+        if (champ) en.push({ champ, lane: c.position ?? "" });
+      }
+      setEnemies(en);
+    },
+    [byCid],
+  );
+
+  // Polling, solange Live-Sync aktiv ist.
+  useEffect(() => {
+    if (!live) return;
+    let stop = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const r = await fetch("/api/champ-select", { cache: "no-store" });
+        const d = (await r.json()) as ChampSelectState;
+        if (stop) return;
+        setLiveStatus(d.status ?? "client_not_running");
+        if (d.status === "in_champ_select") applyChampSelect(d);
+      } catch {
+        if (!stop) setLiveStatus("client_not_running");
+      } finally {
+        if (!stop) timer = setTimeout(poll, 2000);
+      }
+    };
+    poll();
+    return () => {
+      stop = true;
+      clearTimeout(timer);
+    };
+  }, [live, applyChampSelect]);
+
   function setAlly(i: number, patch: Partial<AllyState>) {
     setAllies((prev) => prev.map((a, j) => (j === i ? { ...a, ...patch } : a)));
   }
@@ -173,10 +271,10 @@ export default function TeamPage() {
     );
   }
 
-  async function run() {
+  const run = useCallback(async () => {
+    const myId = ++runIdRef.current;
     setLoading(true);
     setError(null);
-    setResult(null);
     try {
       const res = await fetch("/api/teamcomp", {
         method: "POST",
@@ -196,14 +294,38 @@ export default function TeamPage() {
         }),
       });
       const data = await res.json();
+      // Bei schnellen Picks kann sich ein älterer Lauf überholen -> verwerfen.
+      if (myId !== runIdRef.current) return;
       if (!res.ok) throw new Error(data.error ?? "Analyse fehlgeschlagen.");
       setResult(data);
     } catch (e) {
-      setError((e as Error).message);
+      if (myId === runIdRef.current) setError((e as Error).message);
     } finally {
-      setLoading(false);
+      if (myId === runIdRef.current) setLoading(false);
     }
-  }
+  }, [tier, strategy, proMode, allies, enemies]);
+  runRef.current = run;
+
+  // Signatur des aktuellen Drafts (Ally-Picks + Gegner). Ändert sich genau dann,
+  // wenn ein Pick rein-/rauskommt -> Trigger für die Auto-Neuberechnung.
+  const draftSig = useMemo(
+    () =>
+      JSON.stringify({
+        a: allies.map((a) => a.locked?.cid ?? 0),
+        e: enemies.map((e) => [e.champ.cid, e.lane]),
+      }),
+    [allies, enemies],
+  );
+
+  // Live-Modus: sobald sich der Draft (oder eine Einstellung) ändert, automatisch
+  // neu berechnen. Debounced, damit mehrere schnelle Picks zu einem Lauf werden.
+  useEffect(() => {
+    if (!live) return;
+    const hasPicks = allies.some((a) => a.locked) || enemies.length > 0;
+    if (!hasPicks) return;
+    const t = setTimeout(() => runRef.current(), 1000);
+    return () => clearTimeout(t);
+  }, [live, draftSig, tier, strategy, proMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <main className="max-w-5xl mx-auto px-5 py-8">
@@ -215,6 +337,41 @@ export default function TeamPage() {
         offenen Slot werden Champs vorgeschlagen, die die Comp ergänzen, gegen
         die Gegner stark sind und im Meta/Pro gut dastehen.
       </p>
+
+      {/* Live Champ Select */}
+      <div
+        className="rounded-xl p-4 mb-4 flex items-center gap-4 flex-wrap"
+        style={{
+          background: "var(--panel)",
+          border: `1px solid ${live ? "var(--accent)" : "var(--border)"}`,
+        }}
+      >
+        <button
+          onClick={() => setLive((v) => !v)}
+          className="rounded-lg px-4 py-2 font-semibold whitespace-nowrap"
+          style={
+            live
+              ? { background: "var(--panel-2)", border: "1px solid var(--accent)", color: "var(--accent)" }
+              : { background: "var(--accent)", color: "#1a1205" }
+          }
+        >
+          {live ? "Live-Sync trennen" : "🎮 Mit League-Client verbinden"}
+        </button>
+        {live ? (
+          <span className="flex items-center gap-2 text-sm" style={{ color: "var(--muted)" }}>
+            <span
+              className="inline-block w-2.5 h-2.5 rounded-full"
+              style={{ background: LIVE_STATUS_DOT[liveStatus] }}
+            />
+            {LIVE_STATUS_TEXT[liveStatus]}
+          </span>
+        ) : (
+          <span className="text-sm" style={{ color: "var(--muted)" }}>
+            Übernimmt eure Picks & die Gegner automatisch aus dem laufenden
+            Champ-Select. Funktioniert nur auf dem PC, auf dem der Client läuft.
+          </span>
+        )}
+      </div>
 
       {/* Ally board */}
       <div

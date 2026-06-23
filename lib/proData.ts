@@ -41,6 +41,22 @@ export function proPlayed(cid: number, lane: Lane): boolean {
   return (data.picks[String(cid)]?.byLane[lane] ?? 0) > 0;
 }
 
+/**
+ * Lane-Verteilung eines Champs als Anteile (0..1), normalisiert über seine
+ * Pro-Picks. Leeres Objekt, wenn keine Daten vorliegen. Basis für die
+ * automatische Lane-Zuordnung im Live-Champ-Select.
+ */
+export function laneShares(cid: number): Partial<Record<Lane, number>> {
+  const p = data.picks[String(cid)];
+  if (!p) return {};
+  const total = Object.values(p.byLane).reduce((a, b) => a + (b ?? 0), 0);
+  if (!total) return {};
+  const out: Partial<Record<Lane, number>> = {};
+  for (const [lane, n] of Object.entries(p.byLane))
+    out[lane as Lane] = (n ?? 0) / total;
+  return out;
+}
+
 /** Lift eines Pro-Cores zwischen zwei Champs (0 wenn kein verlässliches Paar). */
 export function coreLift(a: number, b: number): number {
   const list = data.cores[String(a)];

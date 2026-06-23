@@ -1,8 +1,0 @@
-{
-  "/api/teamcomp/route": "/api/teamcomp",
-  "/_not-found/page": "/_not-found",
-  "/api/analyze/route": "/api/analyze",
-  "/api/champions/route": "/api/champions",
-  "/page": "/",
-  "/team/page": "/team"
-}

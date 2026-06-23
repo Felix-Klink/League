@@ -3,3 +3,14 @@
 /dev.log
 /node_modules
 /prod.log
+
+# Next.js build output
+/.next
+/out
+/build
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Env
+.env*.local

@@ -46,7 +46,8 @@ export const CONFIG = {
   MIN_SYNERGY_GAMES: 2000, // Verlässlichkeit eines Paares (filtert Off-Role-Rauschen)
   SYNERGY_NORM: 4, // Delta-Punkte, die synergyScore vom Neutralwert auf 1 heben
   CORE_NORM: 4, // (lift-1)/dies -> proCoreScore (lift ~5 => ~1.0)
-  CORE_LIFT_REASON: 1.4, // ab diesem Lift -> "Pro-Core mit X"
+  CORE_LIFT_REASON: 1.4, // ab diesem Lift zählt ein Anchor zur Pro-Core-Gruppe
+  CORE_GROUP_BONUS: 0.15, // Bonus je zusätzlichem Core-Member (3–5er-Core > Paar)
   PRO_MODE_MULT: { synergy: 1.3, procore: 1.5, team: 1.4, meta: 1.3 }, // Boost im Pro-Modus
   TOP_N: 6,
 };
@@ -430,11 +431,13 @@ export async function buildTeamComp(
       let wSum = 0;
       let bestDuoCid = 0;
       let bestDuoD1 = 0;
-      // 2c) Pro-Core-Completion: stärkster Pro-Core (Co-Occurrence-Lift) mit
-      // einem Anchor — der direkte Hebel zu echten Pro-Comps.
+      // 2c) Pro-Core-Completion: ein echter Pro-Core besteht aus 2–5 Champs.
+      // Wir sammeln ALLE Anchors, mit denen der Kandidat zusammen in Pro-Comps
+      // auftaucht (Co-Occurrence-Lift), und bilden daraus die Core-Gruppe.
       let proCoreScore = 0;
-      let bestCoreCid = 0;
-      let bestCoreLift = 0;
+      // Alle Anchors, die mit dem Kandidaten ein verlässliches Pro-Paar bilden,
+      // für die Gruppen-Begründung (Kandidat + diese = 2..5 Champs).
+      const coreMembers: { cid: number; lift: number }[] = [];
       for (const a of anchors) {
         const syn = synByKey.get(a.cid + ":" + a.lane);
         const row = syn?.[lane]?.get(cid);
@@ -450,15 +453,28 @@ export async function buildTeamComp(
           const s = Math.min(1, (lift - 1) / CONFIG.CORE_NORM);
           // gewichtet nach Anchor (Mains zählen anteilig)
           proCoreScore = Math.max(proCoreScore, s * (0.5 + 0.5 * a.weight));
-          if (lift > bestCoreLift) { bestCoreLift = lift; bestCoreCid = a.cid; }
+          if (lift >= CONFIG.CORE_LIFT_REASON) coreMembers.push({ cid: a.cid, lift });
         }
       }
+      // Bildet der Kandidat mit MEHREREN Locked-Champs ein Pro-Core (echte
+      // 3–5er-Core-Gruppe), ist das stärker als ein einzelnes Paar -> Bonus.
+      if (coreMembers.length > 1)
+        proCoreScore = Math.min(
+          1,
+          proCoreScore * (1 + CONFIG.CORE_GROUP_BONUS * (coreMembers.length - 1)),
+        );
       let synergyScore = 0;
       if (wSum > 0)
         synergyScore = Math.max(0, Math.min(1, 0.5 + duoW / wSum / CONFIG.SYNERGY_NORM));
-      if (bestCoreLift >= CONFIG.CORE_LIFT_REASON) {
-        const al = index.byCid.get(bestCoreCid);
-        if (al) reasons.push({ kind: "procore", label: `Pro-Core mit ${al.name}` });
+      if (coreMembers.length > 0) {
+        // Stärkste Paarungen zuerst; Kandidat + bis zu 4 Anchors = max. 5 Champs.
+        coreMembers.sort((x, y) => y.lift - x.lift);
+        const names = coreMembers
+          .slice(0, 4)
+          .map((m) => index.byCid.get(m.cid)?.name)
+          .filter((n): n is string => Boolean(n));
+        if (names.length)
+          reasons.push({ kind: "procore", label: `Pro-Core mit ${names.join(", ")}` });
       } else if (bestDuoD1 >= 1.0) {
         const al = index.byCid.get(bestDuoCid);
         if (al) reasons.push({ kind: "synergy", label: `Synergie mit ${al.name}` });
